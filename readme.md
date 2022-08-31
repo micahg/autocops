@@ -15,7 +15,7 @@ Setup your config file with a list of sources and destinations, like so:
     "source": "C:/Users/jlinnell/dev/autocops",
     "dest": [
         {
-            "host": "192.168.1.250",
+            "host": "theymightbegiants.com",
             "path": "/home/jflansburgh/temp/autocops"
         }
     ]
