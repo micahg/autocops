@@ -10,16 +10,19 @@ from argparse import ArgumentParser
 from fabric import Connection
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent,\
-                            FileModifiedEvent, FileClosedEvent, FileMovedEvent,\
-                            FileDeletedEvent
+                            FileModifiedEvent, FileClosedEvent,\
+                            FileMovedEvent, FileDeletedEvent
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
 
 
 @dataclass
 class Destination:
+    """Simple destination dataclass."""
     conn: Connection
     path: str
+    sep: str = '/'
+
 
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
@@ -77,11 +80,12 @@ def get_destinations(config):
         path = item['path']
         con = Connection(host)
         dest = Destination(con, path)
+        dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
     return results
 
 
-def full_sync(source, destinations):
+def full_sync(source, destinations, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
@@ -91,23 +95,32 @@ def full_sync(source, destinations):
     logging.info('Syncing folder...')
     for root, dirs, files in os.walk(source):
 
+        # skill contents of this folder if ignored in path
+        if any([ignored in root for ignored in ignore]):
+            continue
+
         # get the relative path
         rel_path = root.partition(source)[2]
 
         # ensure all folder exist on the remote
         for dir in dirs:
-            for destination in destinations:
-                full_dest = os.path.join(destination.path, rel_path, dir)
+
+            # skip ignored directories
+            if dir in ignore:
+                continue
+
+            for dest in destinations:
+                full_dest = dest.sep.join([dest.path, rel_path, dir])
                 cmd = f'mkdir -p {full_dest}'
-                destination.conn.run(cmd)
+                dest.conn.run(cmd)
 
         for file in files:
             full_source = os.path.join(root, file)
 
-            for destination in destinations:
-                full_dest = os.path.join(destination.path, rel_path, file)
+            for dest in destinations:
+                full_dest = dest.sep.join([dest.path, rel_path, file])
                 logging.info(f'{full_source} => {full_dest}')
-                destination.conn.put(full_source, full_dest)
+                dest.conn.put(full_source, full_dest)
     logging.info('All folders synced')
 
 
@@ -154,8 +167,10 @@ def __main__():
     if source_path[-1] != os.sep:
         source_path = f'{source_path}{os.sep}'
 
+    ignored = config['ignore'] if 'ignore' in config else []
+
     destinations = get_destinations(config)
-    full_sync(source_path, destinations)
+    full_sync(source_path, destinations, ignored)
 
 
 if __name__ == '__main__':
