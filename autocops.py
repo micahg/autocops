@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import json
+from threading import Event, Lock
 
 from dataclasses import dataclass
 from argparse import ArgumentParser
@@ -11,9 +12,14 @@ from fabric import Connection
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent,\
                             FileModifiedEvent, FileClosedEvent,\
-                            FileMovedEvent, FileDeletedEvent
+                            FileMovedEvent, FileDeletedEvent,\
+                            DirCreatedEvent, DirDeletedEvent
+
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
+Q_LOCK = Lock()
+Q_SIG = Event()
+EVENTS = []
 
 
 @dataclass
@@ -28,18 +34,10 @@ class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
     def on_any_event(self, event):
-        logging.info(event)
-
-        if isinstance(event, FileCreatedEvent):
-            pass
-        elif isinstance(event, FileModifiedEvent):
-            pass
-        elif isinstance(event, FileClosedEvent):
-            pass
-        elif isinstance(event, FileMovedEvent):
-            pass
-        elif isinstance(event, FileDeletedEvent):
-            pass
+        Q_LOCK.acquire()
+        EVENTS.append(event)
+        Q_LOCK.release()
+        Q_SIG.set()
 
         return super().on_any_event(event)
 
@@ -85,6 +83,41 @@ def get_destinations(config):
     return results
 
 
+def process_event(source, dests, ignored, event):
+    """
+    if isinstance(event, FileCreatedEvent):
+        pass
+    elif isinstance(event, FileModifiedEvent):
+        pass
+    elif isinstance(event, FileClosedEvent):
+        pass
+    elif isinstance(event, FileMovedEvent):
+        pass
+    elif isinstance(event, FileDeletedEvent):
+        pass
+    """
+    rel_path = event.src_path.partition(source)[2]
+
+    if any([ignore in rel_path for ignore in ignored]):
+        logging.debug('Ignoring %s', rel_path)
+        return
+
+    remotes = {dest.sep.join([dest.path, rel_path]): dest for dest in dests}
+
+    for remote, dest in remotes.items():
+        cmd = None
+        if isinstance(event, DirCreatedEvent):
+            cmd = f'mkdir -p {remote}'
+        elif isinstance(event, DirDeletedEvent):
+            cmd = f'rmdir {remote}'
+
+        if cmd is None:
+            logging.error('Unhandled event "%s"', event)
+        else:
+            logging.info('%s "%s"', dest.conn.host, cmd)
+            dest.conn.run(cmd)
+
+
 def full_sync(source, destinations, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
@@ -119,26 +152,29 @@ def full_sync(source, destinations, ignore):
 
             for dest in destinations:
                 full_dest = dest.sep.join([dest.path, rel_path, file])
-                logging.info(f'{full_source} => {full_dest}')
+                logging.info('%s => %s', full_source, full_dest)
                 dest.conn.put(full_source, full_dest)
     logging.info('All folders synced')
 
 
-def watch_folder():
+def watch_folder(source, destinations, ignored):
     """Watch a folder for changes."""
     obsrv = Observer()
     hndlr = AutoCopsHandler()
 
-    obsrv.schedule(hndlr, '/home/micah/dev/autocops', True)
-
+    obsrv.schedule(hndlr, source, True)
     obsrv.start()
 
-    try:
-        while obsrv.is_alive():
-            obsrv.join()
-    finally:
-        obsrv.stop()
-        obsrv.join()
+    while obsrv.is_alive() and Q_SIG.wait():
+        Q_LOCK.acquire()
+        event = EVENTS.pop()
+        Q_SIG.clear()
+        Q_LOCK.release()
+        # logging.info('Processing event %s', event)
+        process_event(source, destinations, ignored, event)
+
+    obsrv.stop()
+    obsrv.join()
 
 
 def __main__():
@@ -169,8 +205,14 @@ def __main__():
 
     ignored = config['ignore'] if 'ignore' in config else []
 
+    # ensure we end up waiting for a signal
+    Q_SIG.clear()
+
     destinations = get_destinations(config)
-    full_sync(source_path, destinations, ignored)
+
+    watch_folder(source_path, destinations, ignored)
+
+    # full_sync(source_path, destinations, ignored)
 
 
 if __name__ == '__main__':

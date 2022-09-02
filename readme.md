@@ -21,3 +21,4 @@ Setup your config file with a list of sources and destinations, like so:
     ]
 }
 ```
+
