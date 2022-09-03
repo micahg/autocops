@@ -1,4 +1,5 @@
 """AutoCops is a module to automatically copy file all over the place."""
+from doctest import UnexpectedException
 import os
 import sys
 import logging
@@ -84,18 +85,6 @@ def get_destinations(config):
 
 
 def process_event(source, dests, ignored, event):
-    """
-    if isinstance(event, FileCreatedEvent):
-        pass
-    elif isinstance(event, FileModifiedEvent):
-        pass
-    elif isinstance(event, FileClosedEvent):
-        pass
-    elif isinstance(event, FileMovedEvent):
-        pass
-    elif isinstance(event, FileDeletedEvent):
-        pass
-    """
     rel_path = event.src_path.partition(source)[2]
 
     if any([ignore in rel_path for ignore in ignored]):
@@ -115,7 +104,10 @@ def process_event(source, dests, ignored, event):
             logging.error('Unhandled event "%s"', event)
         else:
             logging.info('%s "%s"', dest.conn.host, cmd)
-            dest.conn.run(cmd)
+            try:
+                dest.conn.run(cmd)
+            except UnexpectedException as err:
+                logging.error('Unable to execute remote command: %s', err)
 
 
 def full_sync(source, destinations, ignore):
