@@ -98,7 +98,9 @@ def process_event(source, dests, ignored, event):
         logging.debug('Ignoring %s', rel_path)
         return
 
-    remotes = {dest.sep.join([dest.path, rel_path]): dest for dest in dests}
+    remotes = {dest.sep.join([dest.path,
+                              rel_path.replace(os.path.sep, dest.sep)]):
+               dest for dest in dests}
 
     for remote, dest in remotes.items():
         cmd = None
@@ -132,62 +134,27 @@ def process_event(source, dests, ignored, event):
             logging.error('Unhandled event "%s"', event)
 
 
-def full_sync(source, destinations, ignore):
+def full_sync(source, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
 
-    TODO fabric rsync
+    THIS METHOD REQUIRES EXCLUSIVE QUEUE ACCESS AND LOCKING SHOULD BE PERFORMED
+    OUTSIDE. The reason being is that we want to hold off genuine file system
+    events until we have ensured we create a full folder and file structure.
     """
-    logging.info('Syncing folder...')
+    logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
 
         # skill contents of this folder if ignored in path
         if any([ignored in root for ignored in ignore]):
             continue
 
-        # get the relative path
-        rel_path = root.partition(source)[2]
-
-        # ensure all folder exist on the remote
-        for dir in dirs:
-
-            # skip ignored directories
-            if dir in ignore:
-                continue
-
-            for dest in destinations:
-                full_dest = dest.sep.join([dest.path, rel_path, dir])
-                cmd = f'mkdir -p {full_dest}'
-                dest.conn.run(cmd)
-
-        for file in files:
-            full_source = os.path.join(root, file)
-
-            for dest in destinations:
-                full_dest = dest.sep.join([dest.path, rel_path, file])
-                logging.info('%s => %s', full_source, full_dest)
-                dest.conn.put(full_source, full_dest)
-    logging.info('All folders synced')
-
-
-def watch_folder(source, destinations, ignored):
-    """Watch a folder for changes."""
-    obsrv = Observer()
-    hndlr = AutoCopsHandler()
-
-    obsrv.schedule(hndlr, source, True)
-    obsrv.start()
-
-    while obsrv.is_alive() and Q_SIG.wait():
-        Q_LOCK.acquire()
-        event = EVENTS.pop()
-        Q_SIG.clear()
-        Q_LOCK.release()
-        process_event(source, destinations, ignored, event)
-
-    obsrv.stop()
-    obsrv.join()
+        EVENTS.extend([DirCreatedEvent(os.path.join(root, dir))
+                       for dir in dirs if dir not in ignore])
+        EVENTS.extend([FileModifiedEvent(os.path.join(root, file))
+                       for file in files])
+    logging.info('Discovery complete.')
 
 
 def __main__():
@@ -218,14 +185,36 @@ def __main__():
 
     ignored = config['ignore'] if 'ignore' in config else []
 
-    # ensure we end up waiting for a signal
-    Q_SIG.clear()
-
     destinations = get_destinations(config)
 
-    watch_folder(source_path, destinations, ignored)
+    # lock berfore creating the handler so we can prefill the queue with the
+    # base folder structure AND THEN once traversal is complete unlock so the
+    # changes get populated in the queue.
+    Q_LOCK.acquire()
 
-    # full_sync(source_path, destinations, ignored)
+    hndlr = AutoCopsHandler()
+    obsrv = Observer()
+    obsrv.schedule(hndlr, source_path, True)
+    obsrv.start()
+    full_sync(source_path, ignored)
+
+    # in the unlikely event there are no files or folders to sync after startup
+    # clear the signal so we don't start processing
+    if len(EVENTS) > 0:
+        Q_SIG.set()
+
+    Q_LOCK.release()
+
+    while obsrv.is_alive() and Q_SIG.wait():
+        Q_LOCK.acquire()
+        event = EVENTS.pop(0)
+        if len(EVENTS) == 0:
+            Q_SIG.clear()
+        Q_LOCK.release()
+        process_event(source_path, destinations, ignored, event)
+
+    obsrv.stop()
+    obsrv.join()
 
 
 if __name__ == '__main__':
