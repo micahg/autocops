@@ -11,8 +11,7 @@ from argparse import ArgumentParser
 
 from fabric import Connection
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent,\
-                            FileModifiedEvent, FileClosedEvent,\
+from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
                             FileMovedEvent, FileDeletedEvent,\
                             DirCreatedEvent, DirDeletedEvent
 
@@ -33,6 +32,12 @@ class Destination:
 
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
+
+    def on_moved(self, event):
+        Q_LOCK.acquire()
+        EVENTS.append(event)
+        Q_LOCK.release()
+        Q_SIG.set()
 
     def on_any_event(self, event):
         Q_LOCK.acquire()
@@ -85,7 +90,9 @@ def get_destinations(config):
 
 
 def process_event(source, dests, ignored, event):
+    """Process events."""
     rel_path = event.src_path.partition(source)[2]
+    logging.info(event)
 
     if any([ignore in rel_path for ignore in ignored]):
         logging.debug('Ignoring %s', rel_path)
@@ -95,19 +102,34 @@ def process_event(source, dests, ignored, event):
 
     for remote, dest in remotes.items():
         cmd = None
+        src_path = None
+        # working form the theory that created and closed are irelevant
+        # this may cause problems for created (ingored) then moved files
         if isinstance(event, DirCreatedEvent):
             cmd = f'mkdir -p {remote}'
         elif isinstance(event, DirDeletedEvent):
             cmd = f'rmdir {remote}'
+        elif isinstance(event, FileModifiedEvent):
+            src_path = event.src_path
+        elif isinstance(event, FileDeletedEvent):
+            cmd = f'rm {remote}'
+        elif isinstance(event, FileMovedEvent):
+            src_path = remote
+            dest_path = dest.sep.join([dest.path,
+                                       event.dest_path.partition(source)[2]])
+            cmd = f'mv {src_path} {dest_path}'
 
-        if cmd is None:
-            logging.error('Unhandled event "%s"', event)
-        else:
+        if cmd:
             logging.info('%s "%s"', dest.conn.host, cmd)
             try:
                 dest.conn.run(cmd)
             except UnexpectedException as err:
                 logging.error('Unable to execute remote command: %s', err)
+        elif src_path:
+            logging.info('%s => %s:%s', src_path, dest.conn.host, remote)
+            dest.conn.put(src_path, remote)
+        else:
+            logging.error('Unhandled event "%s"', event)
 
 
 def full_sync(source, destinations, ignore):
@@ -162,7 +184,6 @@ def watch_folder(source, destinations, ignored):
         event = EVENTS.pop()
         Q_SIG.clear()
         Q_LOCK.release()
-        # logging.info('Processing event %s', event)
         process_event(source, destinations, ignored, event)
 
     obsrv.stop()
