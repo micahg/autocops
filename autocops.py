@@ -1,42 +1,50 @@
 """AutoCops is a module to automatically copy file all over the place."""
+from doctest import UnexpectedException
 import os
 import sys
 import logging
 import json
 
+from threading import Event, Lock
 from dataclasses import dataclass
 from argparse import ArgumentParser
+from hashlib import sha512
 
 from fabric import Connection
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent,\
-                            FileModifiedEvent, FileClosedEvent, FileMovedEvent,\
-                            FileDeletedEvent
+from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
+                            FileMovedEvent, FileDeletedEvent,\
+                            DirCreatedEvent, DirDeletedEvent, DirMovedEvent
+
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
+Q_LOCK = Lock()
+Q_SIG = Event()
+EVENTS = []
 
 
 @dataclass
 class Destination:
+    """Simple destination dataclass."""
     conn: Connection
     path: str
+    sep: str = '/'
+
 
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
-    def on_any_event(self, event):
-        logging.info(event)
+    def on_moved(self, event):
+        Q_LOCK.acquire()
+        EVENTS.append(event)
+        Q_LOCK.release()
+        Q_SIG.set()
 
-        if isinstance(event, FileCreatedEvent):
-            pass
-        elif isinstance(event, FileModifiedEvent):
-            pass
-        elif isinstance(event, FileClosedEvent):
-            pass
-        elif isinstance(event, FileMovedEvent):
-            pass
-        elif isinstance(event, FileDeletedEvent):
-            pass
+    def on_any_event(self, event):
+        Q_LOCK.acquire()
+        EVENTS.append(event)
+        Q_LOCK.release()
+        Q_SIG.set()
 
         return super().on_any_event(event)
 
@@ -77,55 +85,100 @@ def get_destinations(config):
         path = item['path']
         con = Connection(host)
         dest = Destination(con, path)
+        dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
     return results
 
 
-def full_sync(source, destinations):
+def process_event(source, dests, ignored, event):
+    """Process events."""
+    rel_path = event.src_path.partition(source)[2]
+
+    if any([ignore in rel_path for ignore in ignored]):
+        logging.debug('Ignoring %s', rel_path)
+        return
+
+    remotes = {dest.sep.join([dest.path,
+                              rel_path.replace(os.path.sep, dest.sep)]):
+               dest for dest in dests}
+
+    for remote, dest in remotes.items():
+        cmd = None
+        src_path = None
+        # working form the theory that created and closed are irelevant
+        # this may cause problems for created (ingored) then moved files
+        if isinstance(event, DirCreatedEvent):
+            cmd = f'mkdir -p {remote}'
+        elif isinstance(event, DirDeletedEvent):
+            cmd = f'rmdir {remote}'
+        elif isinstance(event, DirMovedEvent):
+            src_path = remote
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
+
+            # for whatever reason, dir moves on windows include a sub path so
+            # we should trim of the end. For example if we have ./a/b/c (c is a
+            # file) and we rename a to z, the envet gives a source and
+            # destination of ./a/b/ and ./a/b -- which is dumb, but whatever
+            while src_path[-1] == dest_path[-1]:
+                src_path = src_path[:-1]
+                dest_path = dest_path[:-1]
+                pass
+            cmd = f'mv {src_path} {dest_path}'
+        elif isinstance(event, FileModifiedEvent):
+            src_path = event.src_path
+        elif isinstance(event, FileDeletedEvent):
+            cmd = f'rm {remote}'
+        elif isinstance(event, FileMovedEvent):
+            src_path = remote
+            dest_path = event.dest_path.partition(source)[2].replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
+            cmd = f'mv {src_path} {dest_path}'
+
+        if cmd:
+            logging.info('%s "%s"', dest.conn.host, cmd)
+            try:
+                dest.conn.run(cmd)
+            except UnexpectedException as err:
+                logging.error('Unable to execute remote command: %s', err)
+            except Exception as err:
+                logging.error('Unable to execute reomte command: %s', err)
+        elif src_path:
+            r_host = dest.conn.host
+            l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+            r_hash = dest.conn.run(f'sha512sum {remote}').stdout.split()[0]
+            if l_hash.lower() == r_hash.lower():
+                logging.info('identical hash for %s:%s (%s)', r_host, remote,
+                             l_hash)
+            else:
+                logging.info('%s => %s:%s', src_path, r_host, remote)
+                dest.conn.put(src_path, remote)
+        else:
+            logging.error('Unhandled event "%s"', event)
+
+
+def full_sync(source, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
 
-    TODO fabric rsync
+    THIS METHOD REQUIRES EXCLUSIVE QUEUE ACCESS AND LOCKING SHOULD BE PERFORMED
+    OUTSIDE. The reason being is that we want to hold off genuine file system
+    events until we have ensured we create a full folder and file structure.
     """
-    logging.info('Syncing folder...')
+    logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
 
-        # get the relative path
-        rel_path = root.partition(source)[2]
+        # skill contents of this folder if ignored in path
+        if any([ignored in root for ignored in ignore]):
+            continue
 
-        # ensure all folder exist on the remote
-        for dir in dirs:
-            for destination in destinations:
-                full_dest = os.path.join(destination.path, rel_path, dir)
-                cmd = f'mkdir -p {full_dest}'
-                destination.conn.run(cmd)
-
-        for file in files:
-            full_source = os.path.join(root, file)
-
-            for destination in destinations:
-                full_dest = os.path.join(destination.path, rel_path, file)
-                logging.info(f'{full_source} => {full_dest}')
-                destination.conn.put(full_source, full_dest)
-    logging.info('All folders synced')
-
-
-def watch_folder():
-    """Watch a folder for changes."""
-    obsrv = Observer()
-    hndlr = AutoCopsHandler()
-
-    obsrv.schedule(hndlr, '/home/micah/dev/autocops', True)
-
-    obsrv.start()
-
-    try:
-        while obsrv.is_alive():
-            obsrv.join()
-    finally:
-        obsrv.stop()
-        obsrv.join()
+        EVENTS.extend([DirCreatedEvent(os.path.join(root, dir))
+                       for dir in dirs if dir not in ignore])
+        EVENTS.extend([FileModifiedEvent(os.path.join(root, file))
+                       for file in files])
+    logging.info('Discovery complete.')
 
 
 def __main__():
@@ -154,8 +207,38 @@ def __main__():
     if source_path[-1] != os.sep:
         source_path = f'{source_path}{os.sep}'
 
+    ignored = config['ignore'] if 'ignore' in config else []
+
     destinations = get_destinations(config)
-    full_sync(source_path, destinations)
+
+    # lock berfore creating the handler so we can prefill the queue with the
+    # base folder structure AND THEN once traversal is complete unlock so the
+    # changes get populated in the queue.
+    Q_LOCK.acquire()
+
+    hndlr = AutoCopsHandler()
+    obsrv = Observer()
+    obsrv.schedule(hndlr, source_path, True)
+    obsrv.start()
+    full_sync(source_path, ignored)
+
+    # in the unlikely event there are no files or folders to sync after startup
+    # clear the signal so we don't start processing
+    if len(EVENTS) > 0:
+        Q_SIG.set()
+
+    Q_LOCK.release()
+
+    while obsrv.is_alive() and Q_SIG.wait():
+        Q_LOCK.acquire()
+        event = EVENTS.pop(0)
+        if len(EVENTS) == 0:
+            Q_SIG.clear()
+        Q_LOCK.release()
+        process_event(source_path, destinations, ignored, event)
+
+    obsrv.stop()
+    obsrv.join()
 
 
 if __name__ == '__main__':
