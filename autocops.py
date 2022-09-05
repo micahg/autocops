@@ -4,16 +4,17 @@ import os
 import sys
 import logging
 import json
-from threading import Event, Lock
 
+from threading import Event, Lock
 from dataclasses import dataclass
 from argparse import ArgumentParser
+from hashlib import sha512
 
 from fabric import Connection
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
                             FileMovedEvent, FileDeletedEvent,\
-                            DirCreatedEvent, DirDeletedEvent
+                            DirCreatedEvent, DirDeletedEvent, DirMovedEvent
 
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
@@ -111,14 +112,29 @@ def process_event(source, dests, ignored, event):
             cmd = f'mkdir -p {remote}'
         elif isinstance(event, DirDeletedEvent):
             cmd = f'rmdir {remote}'
+        elif isinstance(event, DirMovedEvent):
+            src_path = remote
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
+
+            # for whatever reason, dir moves on windows include a sub path so
+            # we should trim of the end. For example if we have ./a/b/c (c is a
+            # file) and we rename a to z, the envet gives a source and
+            # destination of ./a/b/ and ./a/b -- which is dumb, but whatever
+            while src_path[-1] == dest_path[-1]:
+                src_path = src_path[:-1]
+                dest_path = dest_path[:-1]
+                pass
+            cmd = f'mv {src_path} {dest_path}'
         elif isinstance(event, FileModifiedEvent):
             src_path = event.src_path
         elif isinstance(event, FileDeletedEvent):
             cmd = f'rm {remote}'
         elif isinstance(event, FileMovedEvent):
             src_path = remote
-            dest_path = dest.sep.join([dest.path,
-                                       event.dest_path.partition(source)[2]])
+            dest_path = event.dest_path.partition(source)[2].replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
             cmd = f'mv {src_path} {dest_path}'
 
         if cmd:
@@ -127,9 +143,18 @@ def process_event(source, dests, ignored, event):
                 dest.conn.run(cmd)
             except UnexpectedException as err:
                 logging.error('Unable to execute remote command: %s', err)
+            except Exception as err:
+                logging.error('Unable to execute reomte command: %s', err)
         elif src_path:
-            logging.info('%s => %s:%s', src_path, dest.conn.host, remote)
-            dest.conn.put(src_path, remote)
+            r_host = dest.conn.host
+            l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+            r_hash = dest.conn.run(f'sha512sum {remote}').stdout.split()[0]
+            if l_hash.lower() == r_hash.lower():
+                logging.info('identical hash for %s:%s (%s)', r_host, remote,
+                             l_hash)
+            else:
+                logging.info('%s => %s:%s', src_path, r_host, remote)
+                dest.conn.put(src_path, remote)
         else:
             logging.error('Unhandled event "%s"', event)
 
