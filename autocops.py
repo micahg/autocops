@@ -93,7 +93,6 @@ def get_destinations(config):
 def process_event(source, dests, ignored, event):
     """Process events."""
     rel_path = event.src_path.partition(source)[2]
-    logging.info(event)
 
     if any([ignore in rel_path for ignore in ignored]):
         logging.debug('Ignoring %s', rel_path)
