@@ -18,6 +18,8 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
 
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
+ACTION_HANDLERS = {}
+
 Q_LOCK = Lock()
 Q_SIG = Event()
 EVENTS = []
@@ -33,32 +35,37 @@ class Destination:
     sep: str = '/'
 
 
+class RemoteActionHandler():
+    """Remote action handler"""
+
+    def __init__(self, host) -> None:
+        self.events = []
+        self.conn = Connection(host)
+        self.lock = Lock()
+        self.sig = Event()
+
+    def enqueue(self, action):
+        """Enqueue a remote action."""
+        self.lock.acquire()
+        self.events.append(action)
+        self.lock.release()
+        self.sig.set()
+
+
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
-    def __init__(self, destinations) -> None:
-        self.dest = {d.host: d.path for d in destinations}
+    def __init__(self, source, destinations) -> None:
+        self.source = source
+        self.dests = destinations
         super().__init__()
 
     def on_moved(self, event):
-        # TODO enqueue with every destination
-        Q_LOCK.acquire()
-        EVENTS.append(event)
-        Q_LOCK.release()
-        Q_SIG.set()
-
-        """
-        TODO put this in and see if it helps
+        process_event_two(event, self.source, self.dests)
         return super().on_moved(event)
-        """
 
     def on_any_event(self, event):
-        # TODO enqueue with every destinatons
-        Q_LOCK.acquire()
-        EVENTS.append(event)
-        Q_LOCK.release()
-        Q_SIG.set()
-
+        process_event_two(event, self.source, self.dests)
         return super().on_any_event(event)
 
 
@@ -99,11 +106,72 @@ def get_destinations(config):
     for item in config['dest']:
         host = item['host']
         path = item['path']
-        CONNS[host] = Connection(host)
         dest = Destination(host=host, path=path)
         dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
     return results
+
+
+def enqueue_remote_action(action, dest):
+    """
+    Enqueue a remote action
+    """
+
+    # single threaded during initial local folder traversal
+    if dest.host not in ACTION_HANDLERS:
+        ACTION_HANDLERS[dest.host] = RemoteActionHandler(dest.host)
+
+    ACTION_HANDLERS[dest.host].enqueue(action)
+
+
+def process_event_two(event, source, destinations):
+    """Enqueue remote things."""
+    rel_path = event.src_path.partition(source)[2]
+    remotes = {dest.sep.join([dest.path,
+                              rel_path.replace(os.path.sep, dest.sep)]):
+               dest for dest in destinations}
+
+    for r_path, dest in remotes.items():
+        cmd = None
+        src_path = None
+        # working form the theory that created and closed are irelevant
+        # this may cause problems for created (ingored) then moved files
+        if isinstance(event, DirCreatedEvent):
+            cmd = f'mkdir -p {r_path}'
+        elif isinstance(event, DirDeletedEvent):
+            cmd = f'rmdir {r_path}'
+        elif isinstance(event, DirMovedEvent):
+            src_path = r_path
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
+
+            # for whatever reason, dir moves on windows include a sub path so
+            # we should trim of the end. For example if we have ./a/b/c (c is a
+            # file) and we rename a to z, the envet gives a source and
+            # destination of ./a/b/ and ./a/b -- which is dumb, but whatever
+            while src_path[-1] == dest_path[-1]:
+                src_path = src_path[:-1]
+                dest_path = dest_path[:-1]
+
+            cmd = f'mv {src_path} {dest_path}'
+        elif isinstance(event, FileModifiedEvent):
+            src_path = event.src_path
+        elif isinstance(event, FileDeletedEvent):
+            cmd = f'rm {r_path}'
+        elif isinstance(event, FileMovedEvent):
+            src_path = r_path
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
+            dest_path = dest.sep.join([dest.path, dest_path])
+            cmd = f'mv {src_path} {dest_path}'
+
+        if cmd:
+            enqueue_remote_action(cmd, dest)
+        elif src_path:
+            enqueue_remote_action((src_path, r_path), dest)
+        else:
+            logging.error('Unhandled event "%s"', event)
 
 
 def process_event(source, dests, ignored, event):
@@ -179,7 +247,7 @@ def process_event(source, dests, ignored, event):
             logging.error('Unhandled event "%s"', event)
 
 
-def full_sync(source, ignore):
+def full_sync(source, destinations, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
@@ -191,14 +259,20 @@ def full_sync(source, ignore):
     logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
 
-        # skill contents of this folder if ignored in path
+        # skip contents of this folder if ignored in path
         if any([ignored in root for ignored in ignore]):
             continue
 
-        EVENTS.extend([DirCreatedEvent(os.path.join(root, dir))
-                       for dir in dirs if dir not in ignore])
-        EVENTS.extend([FileModifiedEvent(os.path.join(root, file))
-                       for file in files])
+        # ensure folders get created first
+        for evt in [DirCreatedEvent(os.path.join(root, dir))
+                    for dir in dirs if dir not in ignore]:
+            process_event_two(evt, source, destinations)
+
+        # then get files copied over
+        for evt in [FileModifiedEvent(os.path.join(root, file))
+                    for file in files]:
+            process_event_two(evt, source, destinations)
+
     logging.info('Discovery complete.')
 
 
@@ -239,11 +313,11 @@ def __main__():
 
         destinations.extend(get_destinations(item))
 
-        hndlr = AutoCopsHandler(destinations)
+        hndlr = AutoCopsHandler(source_path, destinations)
         obsrv = Observer()
         obsrv.schedule(hndlr, source_path, True)
         obsrv.start()
-        full_sync(source_path, ignored)
+        full_sync(source_path, destinations, ignored)
 
     # in the unlikely event there are no files or folders to sync after startup
     # clear the signal so we don't start processing
