@@ -21,12 +21,14 @@ LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
 Q_LOCK = Lock()
 Q_SIG = Event()
 EVENTS = []
+CONNS = {}
 
 
 @dataclass
 class Destination:
     """Simple destination dataclass."""
-    conn: Connection
+    # conn: Connection
+    host: str
     path: str
     sep: str = '/'
 
@@ -34,13 +36,24 @@ class Destination:
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
+    def __init__(self, destinations) -> None:
+        self.dest = {d.host: d.path for d in destinations}
+        super().__init__()
+
     def on_moved(self, event):
+        # TODO enqueue with every destination
         Q_LOCK.acquire()
         EVENTS.append(event)
         Q_LOCK.release()
         Q_SIG.set()
 
+        """
+        TODO put this in and see if it helps
+        return super().on_moved(event)
+        """
+
     def on_any_event(self, event):
+        # TODO enqueue with every destinatons
         Q_LOCK.acquire()
         EVENTS.append(event)
         Q_LOCK.release()
@@ -64,13 +77,16 @@ def load_config(config_filename):
         logging.error('Unable to decode JSON configuration: "%s"', err)
         sys.exit(1)
 
-    if 'source' not in result:
-        logging.error('No "source" in config "%s"', config_filename)
-        sys.exit(1)
+    for item in result:
+        if 'source' not in item:
+            logging.error('No "source" in config "%s": %s',
+                          config_filename, item)
+            sys.exit(1)
 
-    if 'dest' not in result:
-        logging.error('No "dest" in config "%s"', config_filename)
-        sys.exit(1)
+        if 'dest' not in item:
+            logging.error('No "dest" in config "%s": %s',
+                          config_filename, item)
+            sys.exit(1)
 
     return result
 
@@ -83,8 +99,8 @@ def get_destinations(config):
     for item in config['dest']:
         host = item['host']
         path = item['path']
-        con = Connection(host)
-        dest = Destination(con, path)
+        CONNS[host] = Connection(host)
+        dest = Destination(host=host, path=path)
         dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
     return results
@@ -98,6 +114,8 @@ def process_event(source, dests, ignored, event):
         logging.debug('Ignoring %s', rel_path)
         return
 
+    # TODO here we also need to track the destination host so we can
+    # enqueue with connections properly
     remotes = {dest.sep.join([dest.path,
                               rel_path.replace(os.path.sep, dest.sep)]):
                dest for dest in dests}
@@ -124,7 +142,7 @@ def process_event(source, dests, ignored, event):
             while src_path[-1] == dest_path[-1]:
                 src_path = src_path[:-1]
                 dest_path = dest_path[:-1]
-                pass
+
             cmd = f'mv {src_path} {dest_path}'
         elif isinstance(event, FileModifiedEvent):
             src_path = event.src_path
@@ -132,7 +150,8 @@ def process_event(source, dests, ignored, event):
             cmd = f'rm {remote}'
         elif isinstance(event, FileMovedEvent):
             src_path = remote
-            dest_path = event.dest_path.partition(source)[2].replace(os.path.sep, dest.sep)
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
             dest_path = dest.sep.join([dest.path, dest_path])
             cmd = f'mv {src_path} {dest_path}'
 
@@ -204,25 +223,27 @@ def __main__():
                         filename=args.logfile if args.logfile else None)
 
     config = load_config(args.config)
-
-    source_path = config['source']
-    if source_path[-1] != os.sep:
-        source_path = f'{source_path}{os.sep}'
-
-    ignored = config['ignore'] if 'ignore' in config else []
-
-    destinations = get_destinations(config)
+    destinations = []
 
     # lock berfore creating the handler so we can prefill the queue with the
     # base folder structure AND THEN once traversal is complete unlock so the
     # changes get populated in the queue.
     Q_LOCK.acquire()
 
-    hndlr = AutoCopsHandler()
-    obsrv = Observer()
-    obsrv.schedule(hndlr, source_path, True)
-    obsrv.start()
-    full_sync(source_path, ignored)
+    for item in config:
+        source_path = item['source']
+        if source_path[-1] != os.sep:
+            source_path = f'{source_path}{os.sep}'
+
+        ignored = item['ignore'] if 'ignore' in item else []
+
+        destinations.extend(get_destinations(item))
+
+        hndlr = AutoCopsHandler(destinations)
+        obsrv = Observer()
+        obsrv.schedule(hndlr, source_path, True)
+        obsrv.start()
+        full_sync(source_path, ignored)
 
     # in the unlikely event there are no files or folders to sync after startup
     # clear the signal so we don't start processing
