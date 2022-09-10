@@ -147,7 +147,9 @@ def process_event(source, dests, ignored, event):
         elif src_path:
             r_host = dest.conn.host
             l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
-            r_hash = dest.conn.run(f'sha512sum {remote}').stdout.split()[0]
+            hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
+            hash_out = dest.conn.run(hash_cmd).stdout
+            r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
             if l_hash.lower() == r_hash.lower():
                 logging.info('identical hash for %s:%s (%s)', r_host, remote,
                              l_hash)
