@@ -3,6 +3,7 @@ from doctest import UnexpectedException
 import os
 import sys
 import logging
+import asyncio
 import json
 
 from threading import Event, Lock
@@ -19,6 +20,7 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
 ACTION_HANDLERS = {}
+OBSERVERS = []
 
 Q_LOCK = Lock()
 Q_SIG = Event()
@@ -46,10 +48,34 @@ class RemoteActionHandler():
 
     def enqueue(self, action):
         """Enqueue a remote action."""
-        self.lock.acquire()
-        self.events.append(action)
-        self.lock.release()
+        with self.lock:
+            self.events.append(action)
         self.sig.set()
+
+    async def handle_actions(self):
+        """Process all actions in an endless loop"""
+        logging.info('OK IN ASYNC')
+        return "HI THERE"
+        if cmd:
+            logging.info('%s "%s"', dest.conn.host, cmd)
+            try:
+                dest.conn.run(cmd)
+            except UnexpectedException as err:
+                logging.error('Unable to execute remote command: %s', err)
+            except Exception as err:
+                logging.error('Unable to execute reomte command: %s', err)
+        elif src_path:
+            r_host = dest.conn.host
+            l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+            hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
+            hash_out = dest.conn.run(hash_cmd).stdout
+            r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
+            if l_hash.lower() == r_hash.lower():
+                logging.info('identical hash for %s:%s (%s)', r_host, remote,
+                             l_hash)
+            else:
+                logging.info('%s => %s:%s', src_path, r_host, remote)
+                dest.conn.put(src_path, remote)
 
 
 class AutoCopsHandler(FileSystemEventHandler):
@@ -276,6 +302,15 @@ def full_sync(source, destinations, ignore):
     logging.info('Discovery complete.')
 
 
+async def process_action_handlers():
+    """Run the async action handlers"""
+    tasks = []
+    for _, handler in ACTION_HANDLERS.items():
+        tasks.append(asyncio.create_task(handler.handle_actions()))
+
+    asyncio.gather(*tasks)
+
+
 def __main__():
     """
     The main method. Parses arguments and sets up logging before we start
@@ -317,25 +352,35 @@ def __main__():
         obsrv = Observer()
         obsrv.schedule(hndlr, source_path, True)
         obsrv.start()
+        OBSERVERS.append(obsrv)
         full_sync(source_path, destinations, ignored)
 
     # in the unlikely event there are no files or folders to sync after startup
     # clear the signal so we don't start processing
-    if len(EVENTS) > 0:
-        Q_SIG.set()
+    # if len(EVENTS) > 0:
+    #     Q_SIG.set()
 
-    Q_LOCK.release()
+    # Q_LOCK.release()
 
-    while obsrv.is_alive() and Q_SIG.wait():
-        Q_LOCK.acquire()
-        event = EVENTS.pop(0)
-        if len(EVENTS) == 0:
-            Q_SIG.clear()
-        Q_LOCK.release()
-        process_event(source_path, destinations, ignored, event)
+    # while obsrv.is_alive():
+    #     Q_LOCK.acquire()
+    #     event = EVENTS.pop(0)
+    #     if len(EVENTS) == 0:
+    #         Q_SIG.clear()
+    #     Q_LOCK.release()
+    #     process_event(source_path, destinations, ignored, event)
 
-    obsrv.stop()
-    obsrv.join()
+    if not all([o.is_alive() for o in OBSERVERS]):
+        logging.error('At least one Watchdog observer was not alive')
+        sys.exit(1)
+
+    # loop = asyncio.get_running_loop()
+
+    asyncio.run(process_action_handlers())
+
+    for obsrv in OBSERVERS:
+        obsrv.stop()
+        obsrv.join()
 
 
 if __name__ == '__main__':
