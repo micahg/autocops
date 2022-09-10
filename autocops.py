@@ -43,39 +43,44 @@ class RemoteActionHandler():
     def __init__(self, host) -> None:
         self.events = []
         self.conn = Connection(host)
-        self.lock = Lock()
-        self.sig = Event()
+        self.lock = asyncio.Lock()
+        self.sig = asyncio.Event()
 
-    def enqueue(self, action):
+    async def enqueue(self, action):
         """Enqueue a remote action."""
-        with self.lock:
+        async with self.lock:
             self.events.append(action)
         self.sig.set()
 
     async def handle_actions(self):
         """Process all actions in an endless loop"""
-        logging.info('OK IN ASYNC')
-        return "HI THERE"
-        if cmd:
-            logging.info('%s "%s"', dest.conn.host, cmd)
-            try:
-                dest.conn.run(cmd)
-            except UnexpectedException as err:
-                logging.error('Unable to execute remote command: %s', err)
-            except Exception as err:
-                logging.error('Unable to execute reomte command: %s', err)
-        elif src_path:
-            r_host = dest.conn.host
-            l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
-            hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
-            hash_out = dest.conn.run(hash_cmd).stdout
-            r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
-            if l_hash.lower() == r_hash.lower():
-                logging.info('identical hash for %s:%s (%s)', r_host, remote,
-                             l_hash)
-            else:
-                logging.info('%s => %s:%s', src_path, r_host, remote)
-                dest.conn.put(src_path, remote)
+        while await self.sig.wait():
+            async with self.lock:
+                event = self.events.pop(0)
+                if len(self.events) == 0:
+                    self.sig.clear()
+
+            if isinstance(event, str):
+                logging.info('%s "%s"', self.conn.host, event)
+                try:
+                    self.conn.run(event)
+                except UnexpectedException as err:
+                    logging.error('Unable to execute remote command: %s', err)
+                except Exception as err:
+                    logging.error('Unable to execute reomte command: %s', err)
+            elif isinstance(event, tuple):
+                src_path, remote = event
+                r_host = self.conn.host
+                l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+                hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
+                hash_out = self.conn.run(hash_cmd).stdout
+                r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
+                if l_hash.lower() == r_hash.lower():
+                    logging.info('identical hash for %s:%s (%s)', r_host,
+                                 remote, l_hash)
+                else:
+                    logging.info('%s => %s:%s', src_path, r_host, remote)
+                    self.conn.put(src_path, remote)
 
 
 class AutoCopsHandler(FileSystemEventHandler):
@@ -87,11 +92,11 @@ class AutoCopsHandler(FileSystemEventHandler):
         super().__init__()
 
     def on_moved(self, event):
-        process_event_two(event, self.source, self.dests)
+        asyncio.run(process_event_two(event, self.source, self.dests))
         return super().on_moved(event)
 
     def on_any_event(self, event):
-        process_event_two(event, self.source, self.dests)
+        asyncio.run(process_event_two(event, self.source, self.dests))
         return super().on_any_event(event)
 
 
@@ -138,7 +143,7 @@ def get_destinations(config):
     return results
 
 
-def enqueue_remote_action(action, dest):
+async def enqueue_remote_action(action, dest):
     """
     Enqueue a remote action
     """
@@ -147,10 +152,10 @@ def enqueue_remote_action(action, dest):
     if dest.host not in ACTION_HANDLERS:
         ACTION_HANDLERS[dest.host] = RemoteActionHandler(dest.host)
 
-    ACTION_HANDLERS[dest.host].enqueue(action)
+    await ACTION_HANDLERS[dest.host].enqueue(action)
 
 
-def process_event_two(event, source, destinations):
+async def process_event_two(event, source, destinations):
     """Enqueue remote things."""
     rel_path = event.src_path.partition(source)[2]
     remotes = {dest.sep.join([dest.path,
@@ -193,9 +198,9 @@ def process_event_two(event, source, destinations):
             cmd = f'mv {src_path} {dest_path}'
 
         if cmd:
-            enqueue_remote_action(cmd, dest)
+            await enqueue_remote_action(cmd, dest)
         elif src_path:
-            enqueue_remote_action((src_path, r_path), dest)
+            await enqueue_remote_action((src_path, r_path), dest)
         else:
             logging.error('Unhandled event "%s"', event)
 
@@ -273,7 +278,7 @@ def process_event(source, dests, ignored, event):
             logging.error('Unhandled event "%s"', event)
 
 
-def full_sync(source, destinations, ignore):
+async def full_sync(source, destinations, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
@@ -292,12 +297,12 @@ def full_sync(source, destinations, ignore):
         # ensure folders get created first
         for evt in [DirCreatedEvent(os.path.join(root, dir))
                     for dir in dirs if dir not in ignore]:
-            process_event_two(evt, source, destinations)
+            await process_event_two(evt, source, destinations)
 
         # then get files copied over
         for evt in [FileModifiedEvent(os.path.join(root, file))
                     for file in files]:
-            process_event_two(evt, source, destinations)
+            await process_event_two(evt, source, destinations)
 
     logging.info('Discovery complete.')
 
@@ -308,10 +313,10 @@ async def process_action_handlers():
     for _, handler in ACTION_HANDLERS.items():
         tasks.append(asyncio.create_task(handler.handle_actions()))
 
-    asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
 
 
-def __main__():
+async def __main__():
     """
     The main method. Parses arguments and sets up logging before we start
     copying things around.
@@ -353,7 +358,7 @@ def __main__():
         obsrv.schedule(hndlr, source_path, True)
         obsrv.start()
         OBSERVERS.append(obsrv)
-        full_sync(source_path, destinations, ignored)
+        await full_sync(source_path, destinations, ignored)
 
     # in the unlikely event there are no files or folders to sync after startup
     # clear the signal so we don't start processing
@@ -376,7 +381,7 @@ def __main__():
 
     # loop = asyncio.get_running_loop()
 
-    asyncio.run(process_action_handlers())
+    await process_action_handlers()
 
     for obsrv in OBSERVERS:
         obsrv.stop()
@@ -384,4 +389,4 @@ def __main__():
 
 
 if __name__ == '__main__':
-    __main__()
+    asyncio.run(__main__())
