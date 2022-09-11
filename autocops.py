@@ -21,6 +21,8 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
 ACTION_HANDLERS = {}
 OBSERVERS = []
+#MAIN_LOOP = asyncio.new_event_loop()
+MAIN_LOOP = asyncio.get_event_loop()
 
 Q_LOCK = Lock()
 Q_SIG = Event()
@@ -45,20 +47,26 @@ class RemoteActionHandler():
         self.conn = Connection(host)
         self.lock = asyncio.Lock()
         self.sig = asyncio.Event()
+        self.sig.clear()
 
     async def enqueue(self, action):
         """Enqueue a remote action."""
         async with self.lock:
             self.events.append(action)
+        logging.info(f'Setting {self.sig}')
         self.sig.set()
+        logging.info(f'Set {self.sig}')
 
     async def handle_actions(self):
         """Process all actions in an endless loop"""
-        while await self.sig.wait():
-            async with self.lock:
-                event = self.events.pop(0)
-                if len(self.events) == 0:
-                    self.sig.clear()
+        while True:
+            logging.info(f'Waiting %s...', self.sig)
+            x = await self.sig.wait()
+            logging.info('Done waiting')
+            # async with self.lock:
+            event = self.events.pop(0)
+            if len(self.events) == 0:
+                self.sig.clear()
 
             if isinstance(event, str):
                 logging.info('%s "%s"', self.conn.host, event)
@@ -92,11 +100,23 @@ class AutoCopsHandler(FileSystemEventHandler):
         super().__init__()
 
     def on_moved(self, event):
-        asyncio.run(process_event_two(event, self.source, self.dests))
+        # loop = asyncio.get_running_loop()
+        # MAIN_LOOP.create_task(process_event_two(event, self.source, self.dests))
+        # asyncio.run_coroutine_threadsafe(process_event_two(event, self.source, self.dests), MAIN_LOOP)
+        # asyncio.run(process_event_two(event, self.source, self.dests))
         return super().on_moved(event)
 
     def on_any_event(self, event):
-        asyncio.run(process_event_two(event, self.source, self.dests))
+        coro = process_event_two(event, self.source, self.dests)
+        fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
+        logging.info('Running Coroutine')
+        x = fut.result()
+        logging.info('Future result is %s', x)
+        # loop = asyncio.get_running_loop()
+        # loop = asyncio.get_event_loop()
+        # MAIN_LOOP.create_task(process_event_two(event, self.source, self.dests))
+        # asyncio.run_coroutine_threadsafe(process_event_two(event, self.source, self.dests), MAIN_LOOP)
+        # asyncio.run(process_event_two(event, self.source, self.dests))
         return super().on_any_event(event)
 
 
@@ -140,6 +160,9 @@ def get_destinations(config):
         dest = Destination(host=host, path=path)
         dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
+        if host not in ACTION_HANDLERS:
+            ACTION_HANDLERS[host] = RemoteActionHandler(host)
+
     return results
 
 
@@ -147,16 +170,12 @@ async def enqueue_remote_action(action, dest):
     """
     Enqueue a remote action
     """
-
-    # single threaded during initial local folder traversal
-    if dest.host not in ACTION_HANDLERS:
-        ACTION_HANDLERS[dest.host] = RemoteActionHandler(dest.host)
-
     await ACTION_HANDLERS[dest.host].enqueue(action)
 
 
 async def process_event_two(event, source, destinations):
     """Enqueue remote things."""
+    logging.info('IN PROCESS EVENT TOO')
     rel_path = event.src_path.partition(source)[2]
     remotes = {dest.sep.join([dest.path,
                               rel_path.replace(os.path.sep, dest.sep)]):
@@ -379,8 +398,6 @@ async def __main__():
         logging.error('At least one Watchdog observer was not alive')
         sys.exit(1)
 
-    # loop = asyncio.get_running_loop()
-
     await process_action_handlers()
 
     for obsrv in OBSERVERS:
@@ -389,4 +406,4 @@ async def __main__():
 
 
 if __name__ == '__main__':
-    asyncio.run(__main__())
+    MAIN_LOOP.run_until_complete(__main__())
