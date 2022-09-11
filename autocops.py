@@ -26,7 +26,6 @@ MAIN_LOOP = asyncio.get_event_loop()
 @dataclass
 class Destination:
     """Simple destination dataclass."""
-    # conn: Connection
     host: str
     path: str
     sep: str = '/'
