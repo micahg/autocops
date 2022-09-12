@@ -90,12 +90,17 @@ class RemoteActionHandler():
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
-    def __init__(self, source, destinations) -> None:
+    def __init__(self, source, destinations, ignored) -> None:
         self.source = source
         self.dests = destinations
+        self.ignored = ignored
         super().__init__()
 
     def on_moved(self, event):
+        # skip contents of this folder if ignored in path
+        if any([ignored in event.src_path for ignored in self.ignored]):
+            return super().on_any_event(event)
+
         coro = process_event(event, self.source, self.dests)
         fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
         try:
@@ -107,6 +112,10 @@ class AutoCopsHandler(FileSystemEventHandler):
         return super().on_moved(event)
 
     def on_any_event(self, event):
+        # skip contents of this folder if ignored in path
+        if any([ignored in event.src_path for ignored in self.ignored]):
+            return super().on_any_event(event)
+
         coro = process_event(event, self.source, self.dests)
         fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
         try:
@@ -291,7 +300,7 @@ async def __main__():
 
         destinations.extend(get_destinations(item))
 
-        hndlr = AutoCopsHandler(source_path, destinations)
+        hndlr = AutoCopsHandler(source_path, destinations, ignored)
         obsrv = Observer()
         obsrv.schedule(hndlr, source_path, True)
         obsrv.start()
