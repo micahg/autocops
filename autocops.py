@@ -64,16 +64,20 @@ class RemoteActionHandler():
             elif isinstance(event, tuple):
                 src_path, remote = event
                 r_host = self.conn.host
-                l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+                try:
+                    l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+                except FileNotFoundError:
+                    logging.error('Not copying disappeared file: %s', src_path)
+                    continue
                 hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
                 hash_out = self.conn.run(hash_cmd).stdout
                 r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
                 if l_hash.lower() == r_hash.lower():
                     logging.info('identical hash for %s:%s (%s)', r_host,
                                  remote, l_hash)
-                else:
-                    logging.info('%s => %s:%s', src_path, r_host, remote)
-                    self.conn.put(src_path, remote)
+                    continue
+                logging.info('%s => %s:%s', src_path, r_host, remote)
+                self.conn.put(src_path, remote)
 
 
 class AutoCopsHandler(FileSystemEventHandler):
