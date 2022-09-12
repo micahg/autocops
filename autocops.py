@@ -11,6 +11,7 @@ from argparse import ArgumentParser
 from hashlib import sha512
 
 from fabric import Connection
+from invoke import UnexpectedExit
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
                             FileMovedEvent, FileDeletedEvent,\
@@ -61,8 +62,8 @@ class RemoteActionHandler():
                     self.conn.run(event)
                 except UnexpectedException as err:
                     logging.error('Unable to execute remote command: %s', err)
-                except Exception as err:
-                    logging.error('PCS %s', err)
+                except UnexpectedExit as err:
+                    logging.error('Unable to execute command: %s', err)
             elif isinstance(event, tuple):
                 src_path, remote = event
                 r_host = self.conn.host
