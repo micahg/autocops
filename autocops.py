@@ -61,6 +61,8 @@ class RemoteActionHandler():
                     self.conn.run(event)
                 except UnexpectedException as err:
                     logging.error('Unable to execute remote command: %s', err)
+                except Exception as err:
+                    logging.error('PCS %s', err)
             elif isinstance(event, tuple):
                 src_path, remote = event
                 r_host = self.conn.host
