@@ -67,7 +67,7 @@ class RemoteActionHandler():
                 try:
                     l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
                 except FileNotFoundError:
-                    logging.error('Not copying disappeared file: %s', src_path)
+                    logging.error('Not hashing disappeared file: %s', src_path)
                     continue
                 hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
                 hash_out = self.conn.run(hash_cmd).stdout
@@ -77,7 +77,11 @@ class RemoteActionHandler():
                                  remote, l_hash)
                     continue
                 logging.info('%s => %s:%s', src_path, r_host, remote)
-                self.conn.put(src_path, remote)
+                try:
+                    self.conn.put(src_path, remote)
+                except FileNotFoundError:
+                    logging.error('Not copying disappeared file: %s', src_path)
+                    continue
 
 
 class AutoCopsHandler(FileSystemEventHandler):
