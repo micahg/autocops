@@ -3,14 +3,15 @@ from doctest import UnexpectedException
 import os
 import sys
 import logging
+import asyncio
 import json
 
-from threading import Event, Lock
 from dataclasses import dataclass
 from argparse import ArgumentParser
 from hashlib import sha512
 
 from fabric import Connection
+from invoke import UnexpectedExit
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
                             FileMovedEvent, FileDeletedEvent,\
@@ -18,34 +19,96 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent,\
 
 
 LOG_FORMAT = '%(asctime)-15s [%(funcName)s] %(message)s'
-Q_LOCK = Lock()
-Q_SIG = Event()
-EVENTS = []
+ACTION_HANDLERS = {}
+OBSERVERS = []
+MAIN_LOOP = asyncio.get_event_loop()
 
 
 @dataclass
 class Destination:
     """Simple destination dataclass."""
-    conn: Connection
+    host: str
     path: str
     sep: str = '/'
+
+
+class RemoteActionHandler():
+    """Remote action handler"""
+
+    def __init__(self, host) -> None:
+        self.events = []
+        self.conn = Connection(host)
+        self.lock = asyncio.Lock()
+        self.sig = asyncio.Event()
+        self.sig.clear()
+
+    async def enqueue(self, action):
+        """Enqueue a remote action."""
+        async with self.lock:
+            self.events.append(action)
+            self.sig.set()
+
+    async def handle_actions(self):
+        """Process all actions in an endless loop"""
+        while await self.sig.wait():
+            async with self.lock:
+                event = self.events.pop(0)
+                if len(self.events) == 0:
+                    self.sig.clear()
+
+            if isinstance(event, str):
+                logging.info('%s "%s"', self.conn.host, event)
+                try:
+                    self.conn.run(event)
+                except UnexpectedException as err:
+                    logging.error('Unable to execute remote command: %s', err)
+                except UnexpectedExit as err:
+                    logging.error('Unable to execute command: %s', err)
+            elif isinstance(event, tuple):
+                src_path, remote = event
+                r_host = self.conn.host
+                try:
+                    l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
+                except FileNotFoundError:
+                    logging.error('Not hashing disappeared file: %s', src_path)
+                    continue
+                hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
+                hash_out = self.conn.run(hash_cmd).stdout
+                r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
+                if l_hash.lower() == r_hash.lower():
+                    logging.info('identical hash for %s:%s (%s)', r_host,
+                                 remote, l_hash)
+                    continue
+                logging.info('%s => %s:%s', src_path, r_host, remote)
+                try:
+                    self.conn.put(src_path, remote)
+                except FileNotFoundError:
+                    logging.error('Not copying disappeared file: %s', src_path)
+                    continue
 
 
 class AutoCopsHandler(FileSystemEventHandler):
     """AutoCops Event Handler"""
 
-    def on_moved(self, event):
-        Q_LOCK.acquire()
-        EVENTS.append(event)
-        Q_LOCK.release()
-        Q_SIG.set()
+    def __init__(self, source, destinations, ignored) -> None:
+        self.source = source
+        self.dests = destinations
+        self.ignored = ignored
+        super().__init__()
 
     def on_any_event(self, event):
-        Q_LOCK.acquire()
-        EVENTS.append(event)
-        Q_LOCK.release()
-        Q_SIG.set()
+        # skip contents of this folder if ignored in path
+        if any([ignored in event.src_path for ignored in self.ignored]):
+            return super().on_any_event(event)
 
+        coro = process_event(event, self.source, self.dests)
+        fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
+        try:
+            fut.result()
+        except TimeoutError as err:
+            logging.error('Coroutine failed on timeout: %s', err)
+        except asyncio.CancelledError as err:
+            logging.error('Coroutine failed on cancellation: %s', err)
         return super().on_any_event(event)
 
 
@@ -64,13 +127,16 @@ def load_config(config_filename):
         logging.error('Unable to decode JSON configuration: "%s"', err)
         sys.exit(1)
 
-    if 'source' not in result:
-        logging.error('No "source" in config "%s"', config_filename)
-        sys.exit(1)
+    for item in result:
+        if 'source' not in item:
+            logging.error('No "source" in config "%s": %s',
+                          config_filename, item)
+            sys.exit(1)
 
-    if 'dest' not in result:
-        logging.error('No "dest" in config "%s"', config_filename)
-        sys.exit(1)
+        if 'dest' not in item:
+            logging.error('No "dest" in config "%s": %s',
+                          config_filename, item)
+            sys.exit(1)
 
     return result
 
@@ -83,36 +149,40 @@ def get_destinations(config):
     for item in config['dest']:
         host = item['host']
         path = item['path']
-        con = Connection(host)
-        dest = Destination(con, path)
+        dest = Destination(host=host, path=path)
         dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
+        if host not in ACTION_HANDLERS:
+            ACTION_HANDLERS[host] = RemoteActionHandler(host)
+
     return results
 
 
-def process_event(source, dests, ignored, event):
-    """Process events."""
+async def enqueue_remote_action(action, dest):
+    """
+    Enqueue a remote action
+    """
+    await ACTION_HANDLERS[dest.host].enqueue(action)
+
+
+async def process_event(event, source, destinations):
+    """Enqueue remote things."""
     rel_path = event.src_path.partition(source)[2]
-
-    if any([ignore in rel_path for ignore in ignored]):
-        logging.debug('Ignoring %s', rel_path)
-        return
-
     remotes = {dest.sep.join([dest.path,
                               rel_path.replace(os.path.sep, dest.sep)]):
-               dest for dest in dests}
+               dest for dest in destinations}
 
-    for remote, dest in remotes.items():
+    for r_path, dest in remotes.items():
         cmd = None
         src_path = None
         # working form the theory that created and closed are irelevant
         # this may cause problems for created (ingored) then moved files
         if isinstance(event, DirCreatedEvent):
-            cmd = f'mkdir -p {remote}'
+            cmd = f'mkdir -p {r_path}'
         elif isinstance(event, DirDeletedEvent):
-            cmd = f'rmdir {remote}'
+            cmd = f'rmdir {r_path}'
         elif isinstance(event, DirMovedEvent):
-            src_path = remote
+            src_path = r_path
             dest_path = event.dest_path.partition(source)[2]
             dest_path = dest_path.replace(os.path.sep, dest.sep)
             dest_path = dest.sep.join([dest.path, dest_path])
@@ -124,43 +194,28 @@ def process_event(source, dests, ignored, event):
             while src_path[-1] == dest_path[-1]:
                 src_path = src_path[:-1]
                 dest_path = dest_path[:-1]
-                pass
+
             cmd = f'mv {src_path} {dest_path}'
         elif isinstance(event, FileModifiedEvent):
             src_path = event.src_path
         elif isinstance(event, FileDeletedEvent):
-            cmd = f'rm {remote}'
+            cmd = f'rm {r_path}'
         elif isinstance(event, FileMovedEvent):
-            src_path = remote
-            dest_path = event.dest_path.partition(source)[2].replace(os.path.sep, dest.sep)
+            src_path = r_path
+            dest_path = event.dest_path.partition(source)[2]
+            dest_path = dest_path.replace(os.path.sep, dest.sep)
             dest_path = dest.sep.join([dest.path, dest_path])
             cmd = f'mv {src_path} {dest_path}'
 
         if cmd:
-            logging.info('%s "%s"', dest.conn.host, cmd)
-            try:
-                dest.conn.run(cmd)
-            except UnexpectedException as err:
-                logging.error('Unable to execute remote command: %s', err)
-            except Exception as err:
-                logging.error('Unable to execute reomte command: %s', err)
+            await enqueue_remote_action(cmd, dest)
         elif src_path:
-            r_host = dest.conn.host
-            l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
-            hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
-            hash_out = dest.conn.run(hash_cmd).stdout
-            r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
-            if l_hash.lower() == r_hash.lower():
-                logging.info('identical hash for %s:%s (%s)', r_host, remote,
-                             l_hash)
-            else:
-                logging.info('%s => %s:%s', src_path, r_host, remote)
-                dest.conn.put(src_path, remote)
+            await enqueue_remote_action((src_path, r_path), dest)
         else:
             logging.error('Unhandled event "%s"', event)
 
 
-def full_sync(source, ignore):
+async def full_sync(source, destinations, ignore):
     """
     Fully sync source with the destinations. It might be worthwhile adding a
     third lib (rsync) so speed this up.
@@ -172,18 +227,33 @@ def full_sync(source, ignore):
     logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
 
-        # skill contents of this folder if ignored in path
+        # skip contents of this folder if ignored in path
         if any([ignored in root for ignored in ignore]):
             continue
 
-        EVENTS.extend([DirCreatedEvent(os.path.join(root, dir))
-                       for dir in dirs if dir not in ignore])
-        EVENTS.extend([FileModifiedEvent(os.path.join(root, file))
-                       for file in files])
+        # ensure folders get created first
+        for evt in [DirCreatedEvent(os.path.join(root, dir))
+                    for dir in dirs if dir not in ignore]:
+            await process_event(evt, source, destinations)
+
+        # then get files copied over
+        for evt in [FileModifiedEvent(os.path.join(root, file))
+                    for file in files]:
+            await process_event(evt, source, destinations)
+
     logging.info('Discovery complete.')
 
 
-def __main__():
+async def process_action_handlers():
+    """Run the async action handlers"""
+    tasks = []
+    for _, handler in ACTION_HANDLERS.items():
+        tasks.append(asyncio.create_task(handler.handle_actions()))
+
+    await asyncio.gather(*tasks)
+
+
+async def __main__():
     """
     The main method. Parses arguments and sets up logging before we start
     copying things around.
@@ -204,44 +274,34 @@ def __main__():
                         filename=args.logfile if args.logfile else None)
 
     config = load_config(args.config)
+    destinations = []
 
-    source_path = config['source']
-    if source_path[-1] != os.sep:
-        source_path = f'{source_path}{os.sep}'
+    for item in config:
+        source_path = item['source']
+        if source_path[-1] != os.sep:
+            source_path = f'{source_path}{os.sep}'
 
-    ignored = config['ignore'] if 'ignore' in config else []
+        ignored = item['ignore'] if 'ignore' in item else []
 
-    destinations = get_destinations(config)
+        destinations.extend(get_destinations(item))
 
-    # lock berfore creating the handler so we can prefill the queue with the
-    # base folder structure AND THEN once traversal is complete unlock so the
-    # changes get populated in the queue.
-    Q_LOCK.acquire()
+        hndlr = AutoCopsHandler(source_path, destinations, ignored)
+        obsrv = Observer()
+        obsrv.schedule(hndlr, source_path, True)
+        obsrv.start()
+        OBSERVERS.append(obsrv)
+        await full_sync(source_path, destinations, ignored)
 
-    hndlr = AutoCopsHandler()
-    obsrv = Observer()
-    obsrv.schedule(hndlr, source_path, True)
-    obsrv.start()
-    full_sync(source_path, ignored)
+    if not all([o.is_alive() for o in OBSERVERS]):
+        logging.error('At least one Watchdog observer was not alive')
+        sys.exit(1)
 
-    # in the unlikely event there are no files or folders to sync after startup
-    # clear the signal so we don't start processing
-    if len(EVENTS) > 0:
-        Q_SIG.set()
+    await process_action_handlers()
 
-    Q_LOCK.release()
-
-    while obsrv.is_alive() and Q_SIG.wait():
-        Q_LOCK.acquire()
-        event = EVENTS.pop(0)
-        if len(EVENTS) == 0:
-            Q_SIG.clear()
-        Q_LOCK.release()
-        process_event(source_path, destinations, ignored, event)
-
-    obsrv.stop()
-    obsrv.join()
+    for obsrv in OBSERVERS:
+        obsrv.stop()
+        obsrv.join()
 
 
 if __name__ == '__main__':
-    __main__()
+    MAIN_LOOP.run_until_complete(__main__())
