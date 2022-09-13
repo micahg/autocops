@@ -96,21 +96,6 @@ class AutoCopsHandler(FileSystemEventHandler):
         self.ignored = ignored
         super().__init__()
 
-    def on_moved(self, event):
-        # skip contents of this folder if ignored in path
-        if any([ignored in event.src_path for ignored in self.ignored]):
-            return super().on_any_event(event)
-
-        coro = process_event(event, self.source, self.dests)
-        fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
-        try:
-            fut.result()
-        except TimeoutError as err:
-            logging.error('Coroutine failed on timeout: %s', err)
-        except asyncio.CancelledError as err:
-            logging.error('Coroutine failed on cancellation: %s', err)
-        return super().on_moved(event)
-
     def on_any_event(self, event):
         # skip contents of this folder if ignored in path
         if any([ignored in event.src_path for ignored in self.ignored]):
