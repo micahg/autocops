@@ -168,11 +168,10 @@ async def enqueue_remote_action(action, dest):
 async def process_event(event, source, destinations):
     """Enqueue remote things."""
     rel_path = event.src_path.partition(source)[2]
-    remotes = {dest.sep.join([dest.path,
-                              rel_path.replace(os.path.sep, dest.sep)]):
-               dest for dest in destinations}
 
-    for r_path, dest in remotes.items():
+    for dest in destinations:
+        r_path = rel_path.replace(os.path.sep, dest.sep)
+        r_path = dest.sep.join([dest.path, r_path])
         cmd = None
         src_path = None
         # working form the theory that created and closed are irelevant
