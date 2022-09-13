@@ -11,14 +11,16 @@ Sometimes you just gota copy a bunch of junk all over the place.
 Setup your config file with a list of sources and destinations, like so:
 
 ```
-{
-    "source": "C:/Users/jlinnell/dev/autocops",
-    "dest": [
-        {
-            "host": "theymightbegiants.com",
-            "path": "/home/jflansburgh/temp/autocops"
-        }
-    ]
-}
+[
+    {
+        "source": "C:/Users/jlinnell/dev/autocops",
+        "dest": [
+            {
+                "host": "theymightbegiants.com",
+                "path": "/home/jflansburgh/temp/autocops"
+            }
+        ]
+    }
+]
 ```
 
