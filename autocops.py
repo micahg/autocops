@@ -266,6 +266,8 @@ async def __main__():
                         help='log file location')
     parser.add_argument('-o', '--output', action='store', dest='output',
                         help='output file location')
+    parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
+                        help='Skip sync on startup')
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -289,7 +291,8 @@ async def __main__():
         obsrv.schedule(hndlr, source_path, True)
         obsrv.start()
         OBSERVERS.append(obsrv)
-        await full_sync(source_path, destinations, ignored)
+        if not args.nosync:
+            await full_sync(source_path, destinations, ignored)
 
     if not all([o.is_alive() for o in OBSERVERS]):
         logging.error('At least one Watchdog observer was not alive')
