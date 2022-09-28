@@ -127,7 +127,11 @@ def load_config(config_filename):
         logging.error('Unable to decode JSON configuration: "%s"', err)
         sys.exit(1)
 
-    for item in result:
+    if 'paths' not in result:
+        logging.error('No "paths" in config "%s": %s', config_filename, result)
+        sys.exit(1)
+
+    for item in result['paths']:
         if 'source' not in item:
             logging.error('No "source" in config "%s": %s',
                           config_filename, item)
@@ -252,6 +256,41 @@ async def process_action_handlers():
     await asyncio.gather(*tasks)
 
 
+async def keep_forward_open(handler: RemoteActionHandler, local, remote,
+                            evt: asyncio.Event):
+    """
+    Open a tunnel and wait forever so it stays open.
+    """
+    with handler.conn.forward_local(local, remote):
+        logging.info(f'Tunnling on {handler} ({local}:{remote})')
+        while await evt.wait():
+            return
+
+
+def add_forward(fwd, evt: asyncio.Event):
+    """
+    Add forwarded ports. Hosts will be in action hanlders that can be used
+    later.
+    """
+    if 'host' not in fwd:
+        logging.error('No host in forward %s', fwd)
+        return None
+    if 'remote' not in fwd:
+        logging.error('No remote in %s', fwd)
+        return None
+    if 'local' not in fwd:
+        logging.error('No local in %s', fwd)
+        return None
+
+    host = fwd['host']
+    local = fwd['local']
+    remote = fwd['remote']
+    handler = RemoteActionHandler(host)
+    ACTION_HANDLERS[host] = handler
+    return keep_forward_open(handler, local, remote, evt)
+
+
+
 async def __main__():
     """
     The main method. Parses arguments and sets up logging before we start
@@ -277,7 +316,15 @@ async def __main__():
     config = load_config(args.config)
     destinations = []
 
-    for item in config:
+    fwd_evt = asyncio.Event()
+    fwd_evt.clear()
+    if 'forwards' in config:
+        for fwd in config['forwards']:
+            coro = add_forward(fwd, fwd_evt)
+            logging.info(coro)
+            asyncio.create_task(coro)
+
+    for item in config['paths']:
         source_path = item['source']
         if source_path[-1] != os.sep:
             source_path = f'{source_path}{os.sep}'
