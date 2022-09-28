@@ -262,7 +262,7 @@ async def keep_forward_open(handler: RemoteActionHandler, local, remote,
     Open a tunnel and wait forever so it stays open.
     """
     with handler.conn.forward_local(local, remote):
-        logging.info(f'Tunnling on {handler} ({local}:{remote})')
+        logging.info(f'Tunnling on %s (%s:%s)', handler, local, remote)
         while await evt.wait():
             return
 
@@ -288,7 +288,6 @@ def add_forward(fwd, evt: asyncio.Event):
     handler = RemoteActionHandler(host)
     ACTION_HANDLERS[host] = handler
     return keep_forward_open(handler, local, remote, evt)
-
 
 
 async def __main__():
