@@ -112,6 +112,14 @@ class AutoCopsHandler(FileSystemEventHandler):
         return super().on_any_event(event)
 
 
+def get_or_create_handler(host):
+    """
+    Get a remote action handler by host or creat it if it doesn't exist already
+    """
+    if host not in ACTION_HANDLERS:
+        ACTION_HANDLERS[host] = RemoteActionHandler(host)
+    return ACTION_HANDLERS[host]
+
 def load_config(config_filename):
     """
     Load configuration
@@ -156,8 +164,7 @@ def get_destinations(config):
         dest = Destination(host=host, path=path)
         dest.sep = item['sep'] if 'sep' in item else dest.sep
         results.append(dest)
-        if host not in ACTION_HANDLERS:
-            ACTION_HANDLERS[host] = RemoteActionHandler(host)
+        get_or_create_handler(host)
 
     return results
 
@@ -262,9 +269,15 @@ async def keep_forward_open(handler: RemoteActionHandler, local, remote,
     Open a tunnel and wait forever so it stays open.
     """
     with handler.conn.forward_local(local, remote):
-        logging.info(f'Tunnling on %s (%s:%s)', handler, local, remote)
+        logging.info('Tunnling on %s (%s:%s)', handler, local, remote)
         while await evt.wait():
             return
+
+
+async def keep_command_running(handler: RemoteActionHandler, command):
+    while True:
+        logging.info('Running "%s" on "%s"', command, handler)
+        handler.conn.run(command)
 
 
 def add_forward(fwd, evt: asyncio.Event):
@@ -285,9 +298,24 @@ def add_forward(fwd, evt: asyncio.Event):
     host = fwd['host']
     local = fwd['local']
     remote = fwd['remote']
-    handler = RemoteActionHandler(host)
-    ACTION_HANDLERS[host] = handler
+    handler = get_or_create_handler(host)
     return keep_forward_open(handler, local, remote, evt)
+
+
+def spawn_remote_cmd(command):
+    """Spawn a remote command and return the pid"""
+    if 'host' not in command:
+        logging.error('No host in command %s', command)
+        return None
+    if 'cmdfile' not in command:
+        logging.error('No cmdfile  in command %s', command)
+        return None
+    host = command['host']
+    handler = get_or_create_handler(host)
+    cmdfile = command['cmdfile']
+    with open(cmdfile, 'rb') as file:
+        cmd = file.read()
+        return keep_command_running(handler, cmd)
 
 
 async def __main__():
@@ -322,6 +350,10 @@ async def __main__():
             coro = add_forward(fwd, fwd_evt)
             logging.info(coro)
             asyncio.create_task(coro)
+
+    if 'commands' in config:
+        for cmd in config['commands']:
+            spawn_remote_cmd(cmd)
 
     for item in config['paths']:
         source_path = item['source']
