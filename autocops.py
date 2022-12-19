@@ -241,7 +241,7 @@ async def full_sync(source, destinations, ignore):
 
         # then get files copied over
         for evt in [FileModifiedEvent(os.path.join(root, file))
-                    for file in files]:
+                    for file in files if file not in ignore]:
             await process_event(evt, source, destinations)
 
     logging.info('Discovery complete.')
@@ -307,6 +307,8 @@ async def __main__():
                         help='output file location')
     parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
                         help='Skip sync on startup')
+    parser.add_argument('-p', '--config-path', action='store', dest='config_path',
+                        help='Specify the config path (eg: specify a separate configration section)')
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -324,7 +326,8 @@ async def __main__():
             logging.info(coro)
             asyncio.create_task(coro)
 
-    for item in config['paths']:
+    config_path = args.config_path if hasattr(args, 'config_path') else 'paths'
+    for item in config[config_path]:
         source_path = item['source']
         if source_path[-1] != os.sep:
             source_path = f'{source_path}{os.sep}'
