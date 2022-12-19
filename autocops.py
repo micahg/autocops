@@ -327,7 +327,7 @@ async def __main__():
             logging.info(coro)
             asyncio.create_task(coro)
 
-    config_path = args.config_path if hasattr(args, 'config_path') else 'paths'
+    config_path = args.config_path if args.config_path else 'paths'
     logging.info('Using config key "%s"', config_path)
     for item in config[config_path]:
         source_path = item['source']
