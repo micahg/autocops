@@ -317,6 +317,7 @@ async def __main__():
 
     config = load_config(args.config)
     destinations = []
+    logging.info('Config keys are: %s', ', '.join(config.keys()))
 
     fwd_evt = asyncio.Event()
     fwd_evt.clear()
@@ -327,6 +328,7 @@ async def __main__():
             asyncio.create_task(coro)
 
     config_path = args.config_path if hasattr(args, 'config_path') else 'paths'
+    logging.info('Using config key "%s"', config_path)
     for item in config[config_path]:
         source_path = item['source']
         if source_path[-1] != os.sep:
