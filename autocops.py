@@ -315,7 +315,7 @@ async def __main__():
     parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
                         help='Skip sync on startup')
     parser.add_argument('-p', '--config-path', action='store', dest='config_path', nargs='?',
-                        help='Specify the config path (eg: specify a separate configration section)')
+                        help='Specify the config path (eg: specify a separate configuration section)')
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
