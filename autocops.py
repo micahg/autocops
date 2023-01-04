@@ -226,6 +226,13 @@ async def full_sync(source, destinations, ignore):
     THIS METHOD REQUIRES EXCLUSIVE QUEUE ACCESS AND LOCKING SHOULD BE PERFORMED
     OUTSIDE. The reason being is that we want to hold off genuine file system
     events until we have ensured we create a full folder and file structure.
+
+    TODO you can run the following command on the rmeote to save a LOT of time i bet
+
+    find . -type f | xargs sha512sum
+
+    This should avoid having to go file by file executing sha512 on a per file basis
+
     """
     logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
@@ -307,6 +314,7 @@ async def __main__():
                         help='output file location')
     parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
                         help='Skip sync on startup')
+    # TODO if no value specified to -p, the print the options based on the config file contents
     parser.add_argument('-p', '--config-path', action='store', dest='config_path',
                         help='Specify the config path (eg: specify a separate configration section)')
     args = parser.parse_args()
