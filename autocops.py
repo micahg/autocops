@@ -226,7 +226,6 @@ async def full_sync(source, destinations, ignore):
     OUTSIDE. The reason being is that we want to hold off genuine file system
     events until we have ensured we create a full folder and file structure.
     """
-    # for host, path, _ in destinations:
     dest_hash = {}
     for d in destinations:
         logging.info('destination is %s:%s', d.host, d.path)
