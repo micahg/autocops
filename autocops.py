@@ -42,6 +42,13 @@ class RemoteActionHandler():
         self.sig = asyncio.Event()
         self.sig.clear()
 
+    def run_sync(self, cmd):
+        """
+        Synchronously run a command. Careful not to use this while looping over
+        asynchronous actions. ONLY DO IT BEFORE THE EVENT LOOP KICKS OFF
+        """
+        return self.conn.run(cmd).stdout
+
     async def enqueue(self, action):
         """Enqueue a remote action."""
         async with self.lock:
@@ -65,19 +72,23 @@ class RemoteActionHandler():
                 except UnexpectedExit as err:
                     logging.error('Unable to execute command: %s', err)
             elif isinstance(event, tuple):
-                src_path, remote = event
+                src_path, remote, r_hash = event
                 r_host = self.conn.host
                 try:
                     l_hash = sha512(open(src_path, 'rb').read()).hexdigest()
                 except FileNotFoundError:
                     logging.error('Not hashing disappeared file: %s', src_path)
                     continue
-                hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
-                hash_out = self.conn.run(hash_cmd).stdout
-                r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
+                if not r_hash:
+                    hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
+                    hash_out = self.conn.run(hash_cmd).stdout
+                    r_hash = hash_out.split()[0] if len(hash_out) > 0 else ''
+                else:
+                    pass
                 if l_hash.lower() == r_hash.lower():
-                    logging.info('identical hash for %s:%s (%s)', r_host,
-                                 remote, l_hash)
+                    logging.info('identical hash for %s:%s', r_host,
+                                 remote)
+                    logging.debug(l_hash)
                     continue
                 logging.info('%s => %s:%s', src_path, r_host, remote)
                 try:
@@ -127,21 +138,6 @@ def load_config(config_filename):
         logging.error('Unable to decode JSON configuration: "%s"', err)
         sys.exit(1)
 
-    if 'paths' not in result:
-        logging.error('No "paths" in config "%s": %s', config_filename, result)
-        sys.exit(1)
-
-    for item in result['paths']:
-        if 'source' not in item:
-            logging.error('No "source" in config "%s": %s',
-                          config_filename, item)
-            sys.exit(1)
-
-        if 'dest' not in item:
-            logging.error('No "dest" in config "%s": %s',
-                          config_filename, item)
-            sys.exit(1)
-
     return result
 
 
@@ -169,7 +165,7 @@ async def enqueue_remote_action(action, dest):
     await ACTION_HANDLERS[dest.host].enqueue(action)
 
 
-async def process_event(event, source, destinations):
+async def process_event(event, source, destinations, dhash=None):
     """Enqueue remote things."""
     rel_path = event.src_path.partition(source)[2]
 
@@ -213,7 +209,10 @@ async def process_event(event, source, destinations):
         if cmd:
             await enqueue_remote_action(cmd, dest)
         elif src_path:
-            await enqueue_remote_action((src_path, r_path), dest)
+            pre_hash = None
+            if dhash and dest.host in dhash and dhash[dest.host][r_path]:
+                pre_hash = dhash[dest.host][r_path]
+            await enqueue_remote_action((src_path, r_path, pre_hash), dest)
         else:
             logging.error('Unhandled event "%s"', event)
 
@@ -227,6 +226,17 @@ async def full_sync(source, destinations, ignore):
     OUTSIDE. The reason being is that we want to hold off genuine file system
     events until we have ensured we create a full folder and file structure.
     """
+    dest_hash = {}
+    for d in destinations:
+        logging.info('destination is %s:%s', d.host, d.path)
+        output = ACTION_HANDLERS[d.host].run_sync(f'find {d.path} -type f | xargs sha512sum')
+        logging.info('output is %s', output)
+        pre_hash = {}
+        for l in output.splitlines():
+            (hsh, path) = l.split()[0:2]
+            pre_hash[path] = hsh
+    dest_hash[d.host] = pre_hash
+
     logging.info('Discovering folder structure...')
     for root, dirs, files in os.walk(source):
 
@@ -242,7 +252,7 @@ async def full_sync(source, destinations, ignore):
         # then get files copied over
         for evt in [FileModifiedEvent(os.path.join(root, file))
                     for file in files if file not in ignore]:
-            await process_event(evt, source, destinations)
+            await process_event(evt, source, destinations, dest_hash)
 
     logging.info('Discovery complete.')
 
@@ -290,7 +300,6 @@ def add_forward(fwd, evt: asyncio.Event):
     return keep_forward_open(handler, local, remote, evt)
 
 
-
 async def __main__():
     """
     The main method. Parses arguments and sets up logging before we start
@@ -307,8 +316,8 @@ async def __main__():
                         help='output file location')
     parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
                         help='Skip sync on startup')
-    parser.add_argument('-p', '--config-path', action='store', dest='config_path',
-                        help='Specify the config path (eg: specify a separate configration section)')
+    parser.add_argument('-p', '--config-path', action='store', dest='config_path', nargs='?',
+                        help='Specify the config path (eg: specify a separate configuration section)')
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -326,6 +335,12 @@ async def __main__():
             coro = add_forward(fwd, fwd_evt)
             logging.info(coro)
             asyncio.create_task(coro)
+    
+    if args.config_path is None:
+        keys = ', '.join(config.keys())
+        logging.info('Available config paths: %s', keys)
+        logging.info('Please specify a config path with the -p parameter')
+        sys.exit(0)
 
     config_path = args.config_path if args.config_path else 'paths'
     logging.info('Using config key "%s"', config_path)
