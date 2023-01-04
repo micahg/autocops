@@ -127,20 +127,20 @@ def load_config(config_filename):
         logging.error('Unable to decode JSON configuration: "%s"', err)
         sys.exit(1)
 
-    if 'paths' not in result:
-        logging.error('No "paths" in config "%s": %s', config_filename, result)
-        sys.exit(1)
+    # if 'paths' not in result:
+    #     logging.error('No "paths" in config "%s": %s', config_filename, result)
+    #     sys.exit(1)
 
-    for item in result['paths']:
-        if 'source' not in item:
-            logging.error('No "source" in config "%s": %s',
-                          config_filename, item)
-            sys.exit(1)
+    # for item in result['paths']:
+    #     if 'source' not in item:
+    #         logging.error('No "source" in config "%s": %s',
+    #                       config_filename, item)
+    #         sys.exit(1)
 
-        if 'dest' not in item:
-            logging.error('No "dest" in config "%s": %s',
-                          config_filename, item)
-            sys.exit(1)
+    #     if 'dest' not in item:
+    #         logging.error('No "dest" in config "%s": %s',
+    #                       config_filename, item)
+    #         sys.exit(1)
 
     return result
 
@@ -314,8 +314,7 @@ async def __main__():
                         help='output file location')
     parser.add_argument('-n', '--no-sync', action='store_true', dest='nosync',
                         help='Skip sync on startup')
-    # TODO if no value specified to -p, the print the options based on the config file contents
-    parser.add_argument('-p', '--config-path', action='store', dest='config_path',
+    parser.add_argument('-p', '--config-path', action='store', dest='config_path', nargs='?',
                         help='Specify the config path (eg: specify a separate configration section)')
     args = parser.parse_args()
 
@@ -334,6 +333,12 @@ async def __main__():
             coro = add_forward(fwd, fwd_evt)
             logging.info(coro)
             asyncio.create_task(coro)
+    
+    if args.config_path is None:
+        keys = ', '.join(config.keys())
+        logging.info('Available config paths: %s', keys)
+        logging.info('Please specify a config path with the -p parameter')
+        sys.exit(0)
 
     config_path = args.config_path if args.config_path else 'paths'
     logging.info('Using config key "%s"', config_path)
