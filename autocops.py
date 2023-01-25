@@ -79,6 +79,9 @@ class RemoteActionHandler():
                 except FileNotFoundError:
                     logging.error('Not hashing disappeared file: %s', src_path)
                     continue
+                except PermissionError:
+                    logging.error('Not hashing inaccessible file %s', src_path)
+                    continue
                 if not r_hash:
                     hash_cmd = f'if [ -e {remote} ]; then sha512sum {remote}; fi'
                     hash_out = self.conn.run(hash_cmd).stdout
@@ -210,7 +213,7 @@ async def process_event(event, source, destinations, dhash=None):
             await enqueue_remote_action(cmd, dest)
         elif src_path:
             pre_hash = None
-            if dhash and dest.host in dhash and dhash[dest.host][r_path]:
+            if dhash and dest.host in dhash and r_path in dhash[dest.host] and dhash[dest.host][r_path]:
                 pre_hash = dhash[dest.host][r_path]
             await enqueue_remote_action((src_path, r_path, pre_hash), dest)
         else:
