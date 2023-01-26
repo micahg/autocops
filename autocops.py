@@ -47,7 +47,12 @@ class RemoteActionHandler():
         Synchronously run a command. Careful not to use this while looping over
         asynchronous actions. ONLY DO IT BEFORE THE EVENT LOOP KICKS OFF
         """
-        return self.conn.run(cmd).stdout
+        try:
+            res = self.conn.run(cmd).stdout
+        except Exception as err:
+            logging.error('Error running on %s: %s', self.conn.host, err)
+            raise err
+        return res
 
     async def enqueue(self, action):
         """Enqueue a remote action."""
@@ -232,7 +237,7 @@ async def full_sync(source, destinations, ignore):
     dest_hash = {}
     for d in destinations:
         logging.info('destination is %s:%s', d.host, d.path)
-        output = ACTION_HANDLERS[d.host].run_sync(f'find {d.path} -type f | xargs sha512sum')
+        output = ACTION_HANDLERS[d.host].run_sync(f'find {d.path} -type f | xargs -d \'\\n\' sha512sum')
         logging.info('output is %s', output)
         pre_hash = {}
         for l in output.splitlines():
